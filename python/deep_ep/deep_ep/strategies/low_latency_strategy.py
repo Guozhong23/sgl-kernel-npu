@@ -179,7 +179,11 @@ class DefaultLowLatencyCommStrategy(LowLatencyEPCommStrategy):
 
 @register_low_latency_strategy("ops")
 class OpsLowLatencyCommStrategy(LowLatencyEPCommStrategy):
-    """Low-latency dispatch and combine using torch_npu MC2 V2 ops."""
+    """Low-latency dispatch and combine using torch_npu MC2 V2 ops.
+
+    Fused padding is opt-in and requires the same, unchanged route weights
+    between dispatch and combine (as in the SGLang Ascend runner).
+    """
 
     def __init__(self, runtime, group: dist.ProcessGroup, comm_alg: Optional[str] = None):
         super().__init__(group)
@@ -196,6 +200,71 @@ class OpsLowLatencyCommStrategy(LowLatencyEPCommStrategy):
             ),
         )
         self.comm_alg = comm_alg
+        # Opt in independently of DEEP_USE_MODE; unsupported paths retain their
+        # original preparation. Fused packing includes the static mask cache.
+        self._fused_padding_enabled = os.getenv("DEEPEP_OPS_FUSED_PADDING", "0") == "1"
+        self._cache_padding_mask_enabled = self._fused_padding_enabled or (
+            os.getenv("DEEPEP_OPS_CACHE_PADDING_MASK", "0") == "1"
+        )
+        self._padding_masks = {}
+
+    def _can_fuse_padding(
+        self,
+        x,
+        topk_ids,
+        topk_weights,
+        capacity,
+        use_fp8,
+        use_ue8m0,
+        use_mxfp4,
+        quant_mode,
+    ):
+        return (
+            self._use_950dt_mte
+            and not (use_fp8 or use_ue8m0 or use_mxfp4)
+            and quant_mode in (None, "bf16")
+            and x.device.type == "npu"
+            and x.ndim == 2
+            and topk_ids.ndim == 2
+            and topk_weights is not None
+            and topk_weights.ndim == 2
+            and isinstance(capacity, int)
+            and not isinstance(capacity, bool)
+            and 0 <= x.size(0) <= capacity
+            and capacity > 0
+            and x.size(1) > 0
+            and topk_ids.size(1) > 0
+            and topk_ids.size(0) == x.size(0)
+            and topk_weights.shape == topk_ids.shape
+            and x.dtype in (torch.bfloat16, torch.float16)
+            and topk_ids.dtype == torch.int32
+            and topk_weights.dtype == torch.float32
+            and x.device == topk_ids.device == topk_weights.device
+            and all(t.is_contiguous() for t in (x, topk_ids, topk_weights))
+        )
+
+    def _get_active_mask(self, x, capacity, cache_allowed):
+        key = (x.device, x.size(0), capacity)
+        if cache_allowed:
+            cached = self._padding_masks.get(key)
+            if cached is not None:
+                return cached
+            is_capturing = getattr(torch.npu, "is_current_stream_capturing", None)
+            if is_capturing is not None and not is_capturing():
+                # Initialize only during eager warmup. A blocking CPU->NPU copy
+                # completes before publication, including for use on other
+                # streams. Never cache dynamic scratch or capture-initialized
+                # data: a different graph could replay before its producer.
+                mask = (torch.arange(capacity, device="cpu") < x.size(0)).to(
+                    device=x.device, non_blocking=False
+                )
+                self._padding_masks[key] = mask
+                return mask
+        # A capture without warmup (or without capture detection) keeps the
+        # original graph-safe initialization; subsequent calls cannot cache it.
+        mask = torch.zeros(capacity, dtype=torch.bool, device=x.device)
+        mask[: x.size(0)] = True
+        return mask
 
     def get_name(self) -> str:
         return "ops"
@@ -227,36 +296,46 @@ class OpsLowLatencyCommStrategy(LowLatencyEPCommStrategy):
     ]:
 
         topk_ids = topk_idx.int()
-        x_active_mask = torch.zeros(
-            num_max_dispatch_tokens_per_rank,
-            dtype=torch.bool,
-            device=x.device,
+        optimize_padding = (
+            self._cache_padding_mask_enabled
+            and self._can_fuse_padding(
+                x,
+                topk_ids,
+                topk_weights,
+                num_max_dispatch_tokens_per_rank,
+                use_fp8,
+                use_ue8m0,
+                use_mxfp4,
+                quant_mode,
+            )
         )
-        x_active_mask[: x.size(0)] = True
+        x_active_mask = self._get_active_mask(
+            x, num_max_dispatch_tokens_per_rank, optimize_padding
+        )
         padding_size = num_max_dispatch_tokens_per_rank - x.size(0)
         if self.comm_alg == "hierarchy":
             assert (
                 topk_weights is not None
             ), "When comm_alg='hierarchy', topk_weights can not be None"
-        x_padding = torch.empty(
-            padding_size,
-            x.size(1),
-            dtype=x.dtype,
-            device=x.device,
-        )
-        x_padding = torch.cat((x, x_padding), dim=0)
-        topk_padding = torch.empty(
-            padding_size,
-            topk_ids.size(1),
-            dtype=topk_ids.dtype,
-            device=topk_ids.device,
-        )
-        topk_padding = torch.cat((topk_ids, topk_padding), dim=0)
-        # MTE applies the source rank's route weights at combine time.
-        weight_padding = None
-        if not self._use_950dt_mte:
-            weight_padding = topk_weights.new_empty((padding_size, topk_weights.size(1)))
-            weight_padding = torch.cat((topk_weights, weight_padding), dim=0)
+        if optimize_padding and self._fused_padding_enabled:
+            from ..ops_padding import pack_low_latency_inputs
+
+            x_padding, topk_padding, weight_padding = pack_low_latency_inputs(
+                x, topk_ids, topk_weights, num_max_dispatch_tokens_per_rank
+            )
+        else:
+            x_padding = torch.empty(
+                padding_size, x.size(1), dtype=x.dtype, device=x.device
+            )
+            x_padding = torch.cat((x, x_padding), dim=0)
+            topk_padding = torch.empty(
+                padding_size, topk_ids.size(1), dtype=topk_ids.dtype, device=topk_ids.device
+            )
+            topk_padding = torch.cat((topk_ids, topk_padding), dim=0)
+            weight_padding = None
+            if not self._use_950dt_mte:
+                weight_padding = topk_weights.new_empty((padding_size, topk_weights.size(1)))
+                weight_padding = torch.cat((topk_weights, weight_padding), dim=0)
 
         (
             packed_recv_x,
@@ -271,7 +350,9 @@ class OpsLowLatencyCommStrategy(LowLatencyEPCommStrategy):
             num_experts=num_experts,
             quant_mode=3 if use_ue8m0 else 2 if use_fp8 else 0,
             comm_alg=self.comm_alg,
-            topk_weights=weight_padding,
+            # MTE applies weights once, at combine. The handle owns packed
+            # weights, but dispatch must still receive expert_scales=None.
+            topk_weights=None if self._use_950dt_mte else weight_padding,
             x_active_mask=x_active_mask,
             num_max_dispatch_tokens_per_rank=num_max_dispatch_tokens_per_rank,
         )
@@ -312,7 +393,6 @@ class OpsLowLatencyCommStrategy(LowLatencyEPCommStrategy):
         out: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, EventOverlap, Callable]:
 
-        topk_ids = topk_idx.int()
         src_num = topk_idx.size(0)
         (
             src_info,
@@ -328,10 +408,18 @@ class OpsLowLatencyCommStrategy(LowLatencyEPCommStrategy):
         ) = handle
 
         if self._use_950dt_mte:
-            weight_padding = topk_weights
-            if src_num < num_max_dispatch_tokens_per_rank:
-                weight_padding = torch.nn.functional.pad(
-                    topk_weights, (0, 0, 0, num_max_dispatch_tokens_per_rank - src_num)
+            if weight_padding is None:
+                weight_padding = topk_weights
+                if src_num < num_max_dispatch_tokens_per_rank:
+                    weight_padding = torch.nn.functional.pad(
+                        topk_weights, (0, 0, 0, num_max_dispatch_tokens_per_rank - src_num)
+                    )
+            else:
+                # Packed during dispatch, possibly on a different stream.
+                # Preserve allocator lifetime until combine has consumed it;
+                # the caller still owns the dispatch->combine execution order.
+                weight_padding.record_stream(
+                    torch.npu.current_stream(weight_padding.device)
                 )
         combined_x = self._npu_low_latency_combine(
             x=x,
