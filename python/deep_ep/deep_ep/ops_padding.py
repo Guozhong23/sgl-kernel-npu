@@ -10,6 +10,10 @@ import torch
 def _get_pack_kernel():
     # Keep importing DeepEP and validating inputs independent of Triton/CANN.
     # Only the JIT object is cached; all output tensors belong to their caller.
+    # The compiler resolves kernel names through fn.__globals__, including
+    # tl.constexpr annotations. A closure-local import works in the Python
+    # interpreter but is not visible to all Triton/Ascend compiler versions.
+    global tl
     import triton
     import triton.language as tl
 
