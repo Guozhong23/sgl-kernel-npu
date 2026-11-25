@@ -7,6 +7,11 @@ from .attention_update import attention_update
 from .compressor import compressor
 from .compressor_v2 import compressor_v2
 from .fia_prep import fia_prep
+from .flash_attn import (
+    flash_attn,
+    flash_attn_metadata,
+    supports_dense_flash_attn_sinks,
+)
 from .flash_decode_bnsd_with_gqa_share_sparse import (
     flash_decode_bnsd_with_gqa_share_sparse,
 )
@@ -68,6 +73,8 @@ __all__ = [
     "compressor_v2",
     "fia_prep",
     "flash_attention_qlens",
+    "flash_attn",
+    "flash_attn_metadata",
     "flash_decode_bnsd_with_gqa_share_sparse",
     "flash_mla",
     "flash_mla_metadata",
@@ -106,4 +113,5 @@ __all__ = [
     "sparse_flash_attention",
     "sparse_flash_mla",
     "sparse_flash_mla_metadata",
+    "supports_dense_flash_attn_sinks",
 ]
