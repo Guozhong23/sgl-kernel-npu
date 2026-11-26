@@ -6,6 +6,7 @@ mapping to 128 visible causal tokens; that mapping still needs device validation
 These are single-device local-head cases, not distributed tensor-parallel tests.
 """
 
+import json
 import math
 from dataclasses import dataclass
 
@@ -116,7 +117,7 @@ def _pack_pages(logical):
     )
 
 
-def _run_attention(logical, paged, *, sliding_window):
+def _run_attention(logical, paged, *, sliding_window, explicit_lengths=False):
     from sgl_kernel_npu.operators.attention import flash_attn, flash_attn_metadata
 
     impl, _ = get_test_impls()
@@ -125,10 +126,16 @@ def _run_attention(logical, paged, *, sliding_window):
     shared = dict(
         cu_seqlens_q=paged["cu_seqlens_q"],
         cu_seqlens_kv=None,
-        seqused_q=None,
+        seqused_q=(
+            torch.tensor(logical.q_lengths, dtype=torch.int32, device="cpu").to(
+                paged["q"].device
+            )
+            if explicit_lengths
+            else None
+        ),
         seqused_kv=paged["seqused_kv"],
-        max_seqlen_q=-1,
-        max_seqlen_kv=-1,
+        max_seqlen_q=max(logical.q_lengths) if explicit_lengths else -1,
+        max_seqlen_kv=max(logical.kv_lengths) if explicit_lengths else -1,
         mask_mode=4 if sliding_window else 3,
         win_left=127 if sliding_window else -1,
         win_right=0 if sliding_window else -1,
@@ -214,17 +221,85 @@ def _cpu_reference(logical, *, sliding_window):
     return result
 
 
-def _assert_output(output, logical, *, sliding_window):
+def _output_and_reference(
+    output, logical, record_property, *, sliding_window, label="output"
+):
     assert output.shape == logical.q.shape
     assert output.dtype == torch.bfloat16
     actual = output.detach().to(device="cpu", dtype=torch.float32)
     expected = _cpu_reference(logical, sliding_window=sliding_window)
-    assert torch.isfinite(actual).all().item()
-    assert torch.isfinite(expected).all().item()
+    actual_finite = torch.isfinite(actual).all().item()
+    expected_finite = torch.isfinite(expected).all().item()
+    metrics = dict(
+        reference="cpu_fp32_from_bf16_qkv",
+        actual_finite=actual_finite,
+        reference_finite=expected_finite,
+        max_abs=None,
+        mean_abs=None,
+        relative_l2=None,
+    )
+    if actual_finite and expected_finite:
+        # FP64 diagnostics also remain representable for finite but corrupted
+        # BF16 outputs. The oracle and correctness comparison stay FP32.
+        difference = actual.double() - expected.double()
+        absolute_error = difference.abs()
+        # Normalize globally, rather than dividing each near-zero element.
+        # These are diagnostics, not additional unvalidated pass thresholds.
+        reference_norm = torch.linalg.vector_norm(expected.double()).item()
+        metrics.update(
+            max_abs=absolute_error.max().item(),
+            mean_abs=absolute_error.mean().item(),
+            relative_l2=(
+                torch.linalg.vector_norm(difference).item()
+                / max(reference_norm, torch.finfo(torch.float32).eps)
+            ),
+        )
+    mode = "SWA" if sliding_window else "Full"
+    serialized = json.dumps(metrics, sort_keys=True, allow_nan=False)
+    # Record before asserting so both passing cases and numerical failures retain
+    # diagnostics in captured output and, with --junitxml, testcase properties.
+    record_property(f"dense_flash_attn_{mode}_{label}", serialized)
+    print(f"dense_flash_attn {mode} {label}: {serialized}")
+    assert actual_finite
+    assert expected_finite
+    return actual, expected
+
+
+def _assert_output(output, logical, record_property, *, sliding_window):
+    actual, expected = _output_and_reference(
+        output, logical, record_property, sliding_window=sliding_window
+    )
     torch.testing.assert_close(
         actual, expected, atol=BF16_STANDARD.atol, rtol=BF16_STANDARD.rtol
     )
     return actual
+
+
+def _check_swapped_request_pages(heads, record_property, *, sliding_window):
+    # Equal lengths keep both swapped rows valid, including the final page tail.
+    # Opposite values make a request mix-up much larger than the BF16 tolerance.
+    logical = _logical_inputs(heads, (1, 1), (129, 129), zeros=True)
+    logical.values[0].fill_(1.0)
+    logical.values[1].fill_(-1.0)
+    paged = _pack_pages(logical)
+    output = _run_attention(logical, paged, sliding_window=sliding_window)
+    _assert_output(output, logical, record_property, sliding_window=sliding_window)
+
+    swapped = {**paged, "block_table": paged["block_table"].flip(0).contiguous()}
+    wrong_output = _run_attention(logical, swapped, sliding_window=sliding_window)
+    wrong_actual, expected = _output_and_reference(
+        wrong_output,
+        logical,
+        record_property,
+        sliding_window=sliding_window,
+        label="swapped_request_pages",
+    )
+    # Only a finite numerical mismatch counts as detecting the swapped mapping.
+    # Kernel/metadata calls and shape/dtype/finite checks stay outside raises.
+    with pytest.raises(AssertionError):
+        torch.testing.assert_close(
+            wrong_actual, expected, atol=BF16_STANDARD.atol, rtol=BF16_STANDARD.rtol
+        )
 
 
 @pytest.mark.parametrize("heads", HEAD_CASES)
@@ -237,46 +312,53 @@ class TestFullAttention:
             pytest.param((1, 1), (129, 257), id="decode"),
         ],
     )
-    def test_random(self, heads, q_lengths, kv_lengths):
+    def test_random(self, heads, q_lengths, kv_lengths, record_property):
         logical = _logical_inputs(heads, q_lengths, kv_lengths)
         output = _run_attention(logical, _pack_pages(logical), sliding_window=False)
-        _assert_output(output, logical, sliding_window=False)
+        _assert_output(output, logical, record_property, sliding_window=False)
 
-    def test_ragged_prefix_crosses_pages(self, heads):
+    def test_ragged_prefix_crosses_pages(self, heads, record_property):
         # Prefixes [120, 63], cuQ [0, 8, 10], usedKV [128, 65]. The first KV ends
         # on a page edge; the second has a one-token tail on its second page.
         logical = _logical_inputs(heads, (8, 2), (128, 65), seed=123)
-        output = _run_attention(logical, _pack_pages(logical), sliding_window=False)
-        _assert_output(output, logical, sliding_window=False)
+        # Exercise explicit usedQ=[8, 2] and exact maxQ/maxKV=8/128; the other
+        # cases retain unspecified maxima and derive query lengths from cuQ.
+        output = _run_attention(
+            logical, _pack_pages(logical), sliding_window=False, explicit_lengths=True
+        )
+        _assert_output(output, logical, record_property, sliding_window=False)
 
-    def test_single_visible_token_sink_weights(self, heads):
+    def test_single_visible_token_sink_weights(self, heads, record_property):
         logical = _logical_inputs(heads, (1,), (1,), zeros=True)
         logical.values[0].fill_(1.0)
         logical.sinks[0::2] = math.log(3.0)
         logical.sinks[1::2] = -math.log(3.0)
         output = _run_attention(logical, _pack_pages(logical), sliding_window=False)
-        actual = _assert_output(output, logical, sliding_window=False)
+        actual = _assert_output(output, logical, record_property, sliding_window=False)
         expected = torch.empty(logical.q.shape, dtype=torch.float32, device="cpu")
         expected[:, 0::2, :] = 0.25
         expected[:, 1::2, :] = 0.75
         torch.testing.assert_close(actual, expected, atol=1e-4, rtol=0)
 
-    def test_multiple_queries_cannot_see_future(self, heads):
+    def test_multiple_queries_cannot_see_future(self, heads, record_property):
         logical = _logical_inputs(heads, (4,), (4,), zeros=True)
         # Only the final key has a nonzero value. Earlier queries must remain
         # exactly zero; the last has four visible keys plus one sink: 5 / 5 = 1.
         logical.values[0][3].fill_(5.0)
         output = _run_attention(logical, _pack_pages(logical), sliding_window=False)
-        actual = _assert_output(output, logical, sliding_window=False)
+        actual = _assert_output(output, logical, record_property, sliding_window=False)
         expected = torch.zeros(logical.q.shape, dtype=torch.float32, device="cpu")
         expected[3].fill_(1.0)
         torch.testing.assert_close(actual, expected, atol=1e-4, rtol=0)
+
+    def test_swapping_request_pages_is_detected(self, heads, record_property):
+        _check_swapped_request_pages(heads, record_property, sliding_window=False)
 
 
 @pytest.mark.parametrize("heads", HEAD_CASES)
 class TestSlidingWindowAttention:
     @pytest.mark.parametrize("query_kind", ["prefill", "prefix-chunk", "decode"])
-    def test_random_127_128_129_tokens(self, heads, query_kind):
+    def test_random_127_128_129_tokens(self, heads, query_kind, record_property):
         kv_lengths = (127, 128, 129)
         q_lengths = {
             "prefill": kv_lengths,
@@ -285,11 +367,13 @@ class TestSlidingWindowAttention:
         }[query_kind]
         logical = _logical_inputs(heads, q_lengths, kv_lengths, seed=2026)
         output = _run_attention(logical, _pack_pages(logical), sliding_window=True)
-        _assert_output(output, logical, sliding_window=True)
+        _assert_output(output, logical, record_property, sliding_window=True)
 
     @pytest.mark.parametrize("query_kind", ["prefill", "prefix-chunk", "decode"])
     @pytest.mark.parametrize("nonzero_key", [0, 1], ids=["k0-excluded", "k1-kept"])
-    def test_exact_128_token_boundary(self, heads, query_kind, nonzero_key):
+    def test_exact_128_token_boundary(
+        self, heads, query_kind, nonzero_key, record_property
+    ):
         # All three forms end at the same absolute query position p=128.
         # Prefix/chunk: prefix=120, Q=9; decode: prefix=128, Q=1.
         q_length = {"prefill": 129, "prefix-chunk": 9, "decode": 1}[query_kind]
@@ -301,8 +385,10 @@ class TestSlidingWindowAttention:
         # its own real public metadata with matching mode and window attributes.
         full = _run_attention(logical, paged, sliding_window=False)
         sliding = _run_attention(logical, paged, sliding_window=True)
-        full_cpu = _assert_output(full, logical, sliding_window=False)
-        sliding_cpu = _assert_output(sliding, logical, sliding_window=True)
+        full_cpu = _assert_output(full, logical, record_property, sliding_window=False)
+        sliding_cpu = _assert_output(
+            sliding, logical, record_property, sliding_window=True
+        )
 
         # Full: 129 keys + sink. SWA: keys 1..128 + sink. Keep atol below the
         # 1/129 vs 1/130 gap (~5.96e-5), while allowing BF16 rounding (<2e-6).
@@ -318,3 +404,6 @@ class TestSlidingWindowAttention:
         torch.testing.assert_close(
             sliding_cpu[-1], expected_sliding, atol=2e-5, rtol=0
         )
+
+    def test_swapping_request_pages_is_detected(self, heads, record_property):
+        _check_swapped_request_pages(heads, record_property, sliding_window=True)

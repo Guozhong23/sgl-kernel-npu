@@ -48,11 +48,11 @@ def _pair_is_packaged():
             return False
         if not isinstance(dependency["python_bindings"], bool):
             raise TypeError("Build manifest python_bindings must be boolean")
-        if not dependency["python_bindings"] or dependency["binding"] == "vendor_only":
-            return False
-        if dependency["binding"] != "upstream_jit":
+        if dependency["binding"] not in ("upstream_jit", "vendor_only"):
             raise RuntimeError("Unexpected ops-transformer binding type")
-        return True
+        if dependency["python_bindings"] != (dependency["binding"] == "upstream_jit"):
+            raise RuntimeError("Inconsistent ops-transformer binding manifest")
+        return dependency["python_bindings"]
     return False
 
 
@@ -98,7 +98,9 @@ def supports_dense_flash_attn_sinks():
     """
     if get_hardware().generation != Generation.ARCH35:
         return False
-    if detect_cann_version() != "9.2.0" or not _pair_is_packaged():
+    # A wheel without this optional pair needs no SDK discovery or native load.
+    # Once a candidate is declared, SDK/extension errors must still propagate.
+    if not _pair_is_packaged() or detect_cann_version() != "9.2.0":
         return False
     _load_pair()
     return True
